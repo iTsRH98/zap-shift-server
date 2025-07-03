@@ -13,7 +13,10 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const serviceAccount = require("./firebase-admin-key.json");
+const decodedKey = Buffer.from(process.env.FB_SERVICE_KEY, "base64").toString(
+  "utf8"
+);
+const serviceAccount = JSON.parse(decodedKey);
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
@@ -33,13 +36,14 @@ const client = new MongoClient(uri, {
 async function run() {
   try {
     // Connect the client to the server	(optional starting in v4.7)
-    await client.connect();
+    // await client.connect();
 
     const db = client.db("parcelDB"); // database name
     const usersCollection = db.collection("users");
-    const parcelCollection = db.collection("parcels");
+    const parcelsCollection = db.collection("parcels");
     const paymentsCollection = db.collection("payments");
     const ridersCollection = db.collection("riders");
+    const trackingsCollection = db.collection("trackings");
 
     const verifyFbToken = async (req, res, next) => {
       const authHeader = req.headers.authorization;
@@ -64,6 +68,16 @@ async function run() {
       const query = { email };
       const user = await usersCollection.findOne(query);
       if (!user || user.role !== "admin") {
+        return res.status(403).send({ message: "forbidden access" });
+      }
+      next();
+    };
+
+    const verifyRider = async (req, res, next) => {
+      const email = req.decoded.email;
+      const query = { email };
+      const user = await usersCollection.findOne(query);
+      if (!user || user.role !== "rider") {
         return res.status(403).send({ message: "forbidden access" });
       }
       next();
@@ -156,7 +170,9 @@ async function run() {
           sort: { createdAt: -1 }, // Newest first
         };
 
-        const parcels = await parcelCollection.find(query, options).toArray();
+        const parcels = await parcelsCollection
+          .find(query, options, userEmail)
+          .toArray();
         res.send(parcels);
       } catch (error) {
         console.error("Error fetching parcels:", error);
@@ -169,7 +185,7 @@ async function run() {
       try {
         const id = req.params.id;
 
-        const parcel = await parcelCollection.findOne({
+        const parcel = await parcelsCollection.findOne({
           _id: new ObjectId(id),
         });
 
@@ -184,11 +200,123 @@ async function run() {
       }
     });
 
+    app.get("/parcels/delivery/status-count", async (req, res) => {
+      const pipeline = [
+        {
+          $group: {
+            _id: "$delivery_status",
+            count: {
+              $sum: 1,
+            },
+          },
+        },
+        {
+          $project: {
+            status: "$_id",
+            count: 1,
+            _id: 0,
+          },
+        },
+      ];
+      const result = await parcelsCollection.aggregate(pipeline).toArray();
+      res.send(result);
+    });
+
+    // GET: Get pending delivery tasks for a rider
+    app.get("/rider/parcels", verifyFBToken, verifyRider, async (req, res) => {
+      try {
+        const email = req.query.email;
+
+        if (!email) {
+          return res.status(400).send({ message: "Rider email is required" });
+        }
+
+        const query = {
+          assigned_rider_email: email,
+          delivery_status: { $in: ["rider_assigned", "in_transit"] },
+        };
+
+        const options = {
+          sort: { creation_date: -1 }, // Newest first
+        };
+
+        const parcels = await parcelsCollection.find(query, options).toArray();
+        res.send(parcels);
+      } catch (error) {
+        console.error("Error fetching rider tasks:", error);
+        res.status(500).send({ message: "Failed to get rider tasks" });
+      }
+    });
+
+    app.patch("/parcels/:id/status", async (req, res) => {
+      const parcelId = req.params.id;
+      const { status } = req.body;
+      const updatedDoc = {
+        delivery_status: status,
+      };
+
+      if (status === "in_transit") {
+        updatedDoc.picked_at = new Date().toISOString();
+      } else if (status === "delivered") {
+        updatedDoc.delivered_at = new Date().toISOString();
+      }
+
+      try {
+        const result = await parcelsCollection.updateOne(
+          { _id: new ObjectId(parcelId) },
+          {
+            $set: updatedDoc,
+          }
+        );
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ message: "Failed to update status" });
+      }
+    });
+
+    // GET: Load completed parcel deliveries for a rider
+    app.get(
+      "/rider/completed-parcels",
+      verifyFBToken,
+      verifyRider,
+      async (req, res) => {
+        try {
+          const email = req.query.email;
+
+          if (!email) {
+            return res.status(400).send({ message: "Rider email is required" });
+          }
+
+          const query = {
+            assigned_rider_email: email,
+            delivery_status: {
+              $in: ["delivered", "service_center_delivered"],
+            },
+          };
+
+          const options = {
+            sort: { creation_date: -1 }, // Latest first
+          };
+
+          const completedParcels = await parcelsCollection
+            .find(query, options)
+            .toArray();
+
+          res.send(completedParcels);
+        } catch (error) {
+          console.error("Error loading completed parcels:", error);
+          res
+            .status(500)
+            .send({ message: "Failed to load completed deliveries" });
+        }
+      }
+    );
+
     app.post("/parcels", async (req, res) => {
       try {
         const newParcel = req.body;
         // newParcel.createdAt = new Date();
-        const result = await parcelCollection.insertOne(newParcel);
+        const result = await parcelsCollection.insertOne(newParcel);
         res.status(201).send(result);
       } catch (error) {
         console.error("Error inserting parcel:", error);
@@ -198,16 +326,17 @@ async function run() {
 
     app.patch("/parcels/:id/assign", async (req, res) => {
       const parcelId = req.params.id;
-      const { riderId, riderName } = req.body;
+      const { riderId, riderName, riderEmail } = req.body;
 
       try {
         // Update parcel
-        await parcelCollection.updateOne(
+        await parcelsCollection.updateOne(
           { _id: new ObjectId(parcelId) },
           {
             $set: {
               delivery_status: "in_transit",
               assigned_rider_id: riderId,
+              assigned_rider_email: riderEmail,
               assigned_rider_name: riderName,
             },
           }
@@ -230,11 +359,50 @@ async function run() {
       }
     });
 
+    app.get("/trackings/:trackingId", async (req, res) => {
+      const trackingId = req.params.trackingId;
+
+      const updates = await trackingsCollection
+        .find({ tracking_id: trackingId })
+        .sort({ timestamp: 1 }) // sort by time ascending
+        .toArray();
+
+      res.json(updates);
+    });
+
+    app.post("/trackings", async (req, res) => {
+      const update = req.body;
+
+      update.timestamp = new Date(); // ensure correct timestamp
+      if (!update.tracking_id || !update.status) {
+        return res
+          .status(400)
+          .json({ message: "tracking_id and status are required." });
+      }
+
+      const result = await trackingsCollection.insertOne(update);
+      res.status(201).json(result);
+    });
+
+    app.patch("/parcels/:id/cashout", async (req, res) => {
+      const id = req.params.id;
+      const result = await parcelsCollection.updateOne(
+        { _id: new ObjectId(id) },
+        {
+          $set: {
+            cashout_status: "cashed_out",
+            cashed_out_at: new Date(),
+          },
+        }
+      );
+      res.send(result);
+    });
+
     app.delete("/parcels/:id", async (req, res) => {
       try {
         const id = req.params.id;
 
-        const result = await parcelCollection.deleteOne({
+        const result = await parcelsCollection.deleteOne({
           _id: new ObjectId(id),
         });
 
@@ -346,7 +514,7 @@ async function run() {
       try {
         const id = req.params.id;
 
-        const result = await parcelCollection.deleteOne({
+        const result = await parcelsCollection.deleteOne({
           _id: new ObjectId(id),
         });
 
@@ -386,7 +554,7 @@ async function run() {
           req.body;
 
         // 1. Update parcel's payment_status
-        const updateResult = await parcelCollection.updateOne(
+        const updateResult = await parcelsCollection.updateOne(
           { _id: new ObjectId(parcelId) },
           {
             $set: {
@@ -439,10 +607,10 @@ async function run() {
     });
 
     // Send a ping to confirm a successful connection
-    await client.db("admin").command({ ping: 1 });
-    console.log(
-      "Pinged your deployment. You successfully connected to MongoDB!"
-    );
+    // await client.db("admin").command({ ping: 1 });
+    // console.log(
+    //   "Pinged your deployment. You successfully connected to MongoDB!"
+    // );
   } finally {
     // Ensures that the client will close when you finish/error
     // await client.close();
